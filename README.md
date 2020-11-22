@@ -7,6 +7,6 @@ Tested with LLVM 10.0.1.
 
 ```bash
 mkdir build && cd build
-cmake -GNinja ..
+cmake -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm -GNinja ..
 ninja
 ```

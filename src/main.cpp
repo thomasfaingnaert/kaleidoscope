@@ -6,6 +6,7 @@
 
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
@@ -31,6 +32,13 @@ enum Token {
   // primary
   tok_identifier = -4,
   tok_number = -5,
+
+  // control flow
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10,
 };
 
 static std::string IdentifierStr; // Filled in if tok_identifier
@@ -56,6 +64,16 @@ static int gettok() {
       return tok_def;
     if (IdentifierStr == "extern")
       return tok_extern;
+    if (IdentifierStr == "if")
+      return tok_if;
+    if (IdentifierStr == "then")
+      return tok_then;
+    if (IdentifierStr == "else")
+      return tok_else;
+    if (IdentifierStr == "for")
+      return tok_for;
+    if (IdentifierStr == "in")
+      return tok_in;
 
     // Not a keyword, so token is an identifier
     return tok_identifier;
@@ -126,6 +144,33 @@ class VariableExprAST : public ExprAST {
 
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
+  virtual llvm::Value *codegen();
+};
+
+// If-then-else expression
+class IfExprAST : public ExprAST {
+  std::unique_ptr<ExprAST> Cond, Then, Else;
+
+public:
+  IfExprAST(std::unique_ptr<ExprAST> Cond, std::unique_ptr<ExprAST> Then,
+            std::unique_ptr<ExprAST> Else)
+      : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+
+  virtual llvm::Value *codegen();
+};
+
+// For expression
+class ForExprAST : public ExprAST {
+  std::string VarName;
+  std::unique_ptr<ExprAST> Start, Cond, Step, Body;
+
+public:
+  ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start,
+             std::unique_ptr<ExprAST> Cond, std::unique_ptr<ExprAST> Step,
+             std::unique_ptr<ExprAST> Body)
+      : VarName(VarName), Start(std::move(Start)), Cond(std::move(Cond)),
+        Step(std::move(Step)), Body(std::move(Body)) {}
+
   virtual llvm::Value *codegen();
 };
 
@@ -200,6 +245,87 @@ llvm::Value *LogErrorV(const char *Str) {
 
 std::unique_ptr<ExprAST> ParseExpression(); // forward decl
 
+// ifexpr ::= 'if' expression 'then' expression 'else' expression
+std::unique_ptr<ExprAST> ParseIfExpr() {
+  getNextToken(); // Eat the 'if'
+
+  // get the condition
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  if (CurTok != tok_then)
+    return LogError("expected 'then'");
+
+  getNextToken(); // Eat the 'then'
+
+  auto Then = ParseExpression();
+  if (!Then)
+    return nullptr;
+
+  if (CurTok != tok_else)
+    return LogError("expected 'else'");
+
+  getNextToken(); // Eat the 'else'
+
+  auto Else = ParseExpression();
+  if (!Else)
+    return nullptr;
+
+  return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then),
+                                     std::move(Else));
+}
+
+// forexpr ::= 'for' identifier '=' expression ',' expression [',' expression]
+//             'in' expression
+std::unique_ptr<ExprAST> ParseForExpr() {
+  getNextToken(); // Eat the 'for'
+
+  if (CurTok != tok_identifier)
+    return LogError("expected identifier after for");
+
+  std::string IdName = IdentifierStr;
+  getNextToken(); // Eat the identifier
+
+  if (CurTok != '=')
+    return LogError("expected '=' after for");
+  getNextToken(); // Eat the '='
+
+  auto Start = ParseExpression();
+  if (!Start)
+    return nullptr;
+
+  if (CurTok != ',')
+    return LogError("expected ',' after for start value");
+  getNextToken(); // Eat the ','
+
+  auto Cond = ParseExpression();
+  if (!Cond)
+    return nullptr;
+
+  std::unique_ptr<ExprAST> Step;
+
+  // Check if the optional step value is present
+  if (CurTok == ',') {
+    getNextToken(); // Eat the ','
+
+    Step = ParseExpression();
+    if (!Step)
+      return nullptr;
+  }
+
+  if (CurTok != tok_in)
+    return LogError("expected 'in' after for");
+  getNextToken(); // Eat the 'in'
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(Cond),
+                                      std::move(Step), std::move(Body));
+}
+
 // numberexpr ::= number
 std::unique_ptr<ExprAST> ParseNumberExpr() {
   auto Result = std::make_unique<NumberExprAST>(NumVal);
@@ -260,6 +386,8 @@ std::unique_ptr<ExprAST> ParseIdentifierExpr() {
 // primary ::= identifierexpr
 //         ::= numberexpr
 //         ::= parenexpr
+//         ::= ifexpr
+//         ::= forexpr
 std::unique_ptr<ExprAST> ParsePrimary() {
   switch (CurTok) {
   default:
@@ -270,6 +398,10 @@ std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseNumberExpr();
   case '(':
     return ParseParenExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
   }
 }
 
@@ -423,6 +555,151 @@ llvm::Value *VariableExprAST::codegen() {
   if (!V)
     LogErrorV("Unknown variable name");
   return V;
+}
+
+llvm::Value *IfExprAST::codegen() {
+  llvm::Value *CondV = Cond->codegen();
+  if (!CondV)
+    return nullptr;
+
+  // Like all values, condition is floating point, so convert it to a bool by
+  // using a != 0.0 comparison
+  CondV = Builder.CreateFCmpONE(
+      CondV, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)), "ifcond");
+
+  auto TheFunction = Builder.GetInsertBlock()->getParent();
+
+  // Create basic blocks for the then and else cases, and the basic block that
+  // merges them.
+  llvm::BasicBlock *ThenBB =
+      llvm::BasicBlock::Create(TheContext, "then", TheFunction);
+  llvm::BasicBlock *ElseBB =
+      llvm::BasicBlock::Create(TheContext, "else", TheFunction);
+  llvm::BasicBlock *ContBB =
+      llvm::BasicBlock::Create(TheContext, "ifcont", TheFunction);
+
+  Builder.CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // Emit the 'then' expression
+  Builder.SetInsertPoint(ThenBB);
+
+  llvm::Value *ThenV = Then->codegen();
+  if (!ThenV)
+    return nullptr;
+
+  Builder.CreateBr(ContBB);
+
+  // NOTE: emitting the 'Then' expression may have changed the current basic
+  // block (e.g. for nested if-expressions), so we need to explicitly set ThenBB
+  // again for the PHI node to be correct.
+  ThenBB = Builder.GetInsertBlock();
+
+  // Emit the 'else' expression
+  Builder.SetInsertPoint(ElseBB);
+
+  llvm::Value *ElseV = Else->codegen();
+  if (!ElseV)
+    return nullptr;
+
+  Builder.CreateBr(ContBB);
+
+  // Same thing for the else
+  ElseBB = Builder.GetInsertBlock();
+
+  // Emit merge basic block
+  Builder.SetInsertPoint(ContBB);
+  auto PhiNode =
+      Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, "iftmp");
+
+  PhiNode->addIncoming(ThenV, ThenBB);
+  PhiNode->addIncoming(ElseV, ElseBB);
+
+  return PhiNode;
+}
+
+llvm::Value *ForExprAST::codegen() {
+  // Emit the start value first.
+  llvm::Value *StartVal = Start->codegen();
+  if (!StartVal)
+    return nullptr;
+
+  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  llvm::BasicBlock *PreloopBB = Builder.GetInsertBlock();
+
+  // Make a basic block for the loop.
+  llvm::BasicBlock *LoopBB =
+      llvm::BasicBlock::Create(TheContext, "loop", TheFunction);
+
+  // Create an explicit fallthrough from the preloop BB to the loop BB.
+  Builder.CreateBr(LoopBB);
+
+  // Start inserting in the loop BB.
+  Builder.SetInsertPoint(LoopBB);
+
+  // Create a PHI node for the loop variable.
+  llvm::PHINode *PHINode =
+      Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, VarName);
+  PHINode->addIncoming(StartVal, PreloopBB);
+
+  // Update the symbol table in the loop, so that 'VarName' refers to this PHI
+  // node. Save the old value, so we can restore it later.
+  llvm::Value *OldValue = NamedValues[VarName];
+  NamedValues[VarName] = PHINode;
+
+  // Emit the body of the loop. This, like any other expression, can change the
+  // current BB. Note that we don't care about the return value (i.e. the value
+  // computed by the body).
+  if (!Body->codegen())
+    return nullptr;
+
+  // Emit the step value.
+  llvm::Value *StepValue = nullptr;
+  if (Step) { // Step is specified.
+    StepValue = Step->codegen();
+    if (!StepValue)
+      return nullptr;
+  } else { // No step specified, so use 1.0.
+    StepValue = llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0));
+  }
+
+  // Get the next value of the loop variable.
+  llvm::Value *NextValue = Builder.CreateFAdd(PHINode, StepValue, "nextvar");
+
+  // Evaluate the loop condition.
+  llvm::Value *CondValue = Cond->codegen();
+  if (!CondValue)
+    return nullptr;
+
+  // Like all values, the condition is floating point, so convert it to a bool
+  // by using a != 0.0 comparison.
+  CondValue = Builder.CreateFCmpONE(
+      CondValue, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)),
+      "loopcond");
+
+  //  Create a BB for after the loop.
+  llvm::BasicBlock *AfterBB =
+      llvm::BasicBlock::Create(TheContext, "afterloop", TheFunction);
+
+  // Create the loop branch.
+  Builder.CreateCondBr(CondValue, LoopBB, AfterBB);
+
+  // Remember the current basic block for the PHI-node.
+  llvm::BasicBlock *LoopEndBB = Builder.GetInsertBlock();
+
+  // From this point on, start inserting in the end block.
+  Builder.SetInsertPoint(AfterBB);
+
+  // Add the other value of the PHI node.
+  PHINode->addIncoming(NextValue, LoopEndBB);
+
+  // Restore the symbol-table mapping.
+  if (OldValue)
+    NamedValues[VarName] = OldValue;
+  else
+    NamedValues.erase(VarName);
+
+  // A for expression always returns 0.
+  return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(TheContext));
 }
 
 llvm::Value *BinaryExprAST::codegen() {

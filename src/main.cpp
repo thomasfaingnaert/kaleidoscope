@@ -604,8 +604,6 @@ void HandleTopLevelExpression() {
 
 void MainLoop() {
   while (true) {
-    std::cerr << "ready> ";
-
     switch (CurTok) {
     case tok_eof:
       return; // end of file, stop running
@@ -614,12 +612,15 @@ void MainLoop() {
       break;
     case tok_def:
       HandleDefinition();
+      std::cerr << "\nready> ";
       break;
     case tok_extern:
       HandleExtern();
+      std::cerr << "\nready> ";
       break;
     default:
       HandleTopLevelExpression();
+      std::cerr << "\nready> ";
       break;
     }
   }
@@ -695,9 +696,6 @@ int main(int argc, char *argv[]) {
 
   // Run main loop
   MainLoop();
-
-  // Print entire module on exit
-  TheModule->print(llvm::errs(), nullptr);
 
   return 0;
 }

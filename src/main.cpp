@@ -16,6 +16,7 @@
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
+#include "llvm/Transforms/Utils.h"
 
 #include "KaleidoscopeJIT.h"
 
@@ -43,6 +44,9 @@ enum Token {
   // operators
   tok_binary = -11,
   tok_unary = -12,
+
+  // var definition,
+  tok_var = -13,
 };
 
 static std::string IdentifierStr; // Filled in if tok_identifier
@@ -82,6 +86,8 @@ static int gettok() {
       return tok_binary;
     if (IdentifierStr == "unary")
       return tok_unary;
+    if (IdentifierStr == "var")
+      return tok_var;
 
     // Not a keyword, so token is an identifier
     return tok_identifier;
@@ -153,6 +159,7 @@ class VariableExprAST : public ExprAST {
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
   virtual llvm::Value *codegen();
+  std::string getName() const { return Name; }
 };
 
 // If-then-else expression
@@ -178,6 +185,20 @@ public:
              std::unique_ptr<ExprAST> Body)
       : VarName(VarName), Start(std::move(Start)), Cond(std::move(Cond)),
         Step(std::move(Step)), Body(std::move(Body)) {}
+
+  virtual llvm::Value *codegen();
+};
+
+// Expression class for var/in
+class VarExprAST : public ExprAST {
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+  std::unique_ptr<ExprAST> Body;
+
+public:
+  VarExprAST(
+      std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames,
+      std::unique_ptr<ExprAST> Body)
+      : VarNames(std::move(VarNames)), Body(std::move(Body)) {}
 
   virtual llvm::Value *codegen();
 };
@@ -278,7 +299,7 @@ llvm::Value *LogErrorV(const char *Str) {
 /* Parser */
 
 std::unique_ptr<ExprAST> ParseExpression(); // forward decl
-std::unique_ptr<ExprAST> ParseUnary(); // forward decl
+std::unique_ptr<ExprAST> ParseUnary();      // forward decl
 
 // ifexpr ::= 'if' expression 'then' expression 'else' expression
 std::unique_ptr<ExprAST> ParseIfExpr() {
@@ -418,11 +439,60 @@ std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+// varexpr ::= 'var' identifier ('=' expression)?
+//             (',' identifier ('=' expression)?)* 'in' expression
+std::unique_ptr<ExprAST> ParseVarExpr() {
+  getNextToken(); // eat the var.
+
+  std::vector<std::pair<std::string, std::unique_ptr<ExprAST>>> VarNames;
+
+  // At least one variable name is required.
+  if (CurTok != tok_identifier)
+    return LogError("expected identifier after var");
+
+  while (true) {
+    std::string Name = IdentifierStr;
+    getNextToken(); // eat identifier.
+
+    // Read the optional initializer.
+    std::unique_ptr<ExprAST> Init;
+    if (CurTok == '=') {
+      getNextToken(); // eat the '='.
+
+      Init = ParseExpression();
+      if (!Init)
+        return nullptr;
+    }
+
+    VarNames.push_back(std::make_pair(Name, std::move(Init)));
+
+    // End of var list, exit loop.
+    if (CurTok != ',')
+      break;
+    getNextToken(); // eat the ','.
+
+    if (CurTok != tok_identifier)
+      return LogError("expected identifier list after var");
+  }
+
+  // At this point, we have to have 'in'.
+  if (CurTok != tok_in)
+    return LogError("expected 'in' keyword after 'var'");
+  getNextToken(); // eat 'in'.
+
+  auto Body = ParseExpression();
+  if (!Body)
+    return nullptr;
+
+  return std::make_unique<VarExprAST>(std::move(VarNames), std::move(Body));
+}
+
 // primary ::= identifierexpr
 //         ::= numberexpr
 //         ::= parenexpr
 //         ::= ifexpr
 //         ::= forexpr
+//         ::= varexpr
 std::unique_ptr<ExprAST> ParsePrimary() {
   switch (CurTok) {
   default:
@@ -437,6 +507,8 @@ std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseIfExpr();
   case tok_for:
     return ParseForExpr();
+  case tok_var:
+    return ParseVarExpr();
   }
 }
 
@@ -630,7 +702,7 @@ llvm::IRBuilder<> Builder(TheContext);
 std::unique_ptr<llvm::Module> TheModule;
 std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
-std::map<llvm::StringRef, llvm::Value *> NamedValues; // symbol table
+std::map<std::string, llvm::AllocaInst *> NamedValues; // symbol table
 std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
 /* Codegen */
@@ -649,6 +721,17 @@ llvm::Function *getFunction(const std::string &name) {
   return nullptr;
 }
 
+// CreateEntryBlockAlloca - Create an alloca instruction in the entry block of
+// the function. This is used for mutable variables etc.
+llvm::AllocaInst *CreateEntryBlockAlloca(llvm::Function *TheFunction,
+                                         const std::string &VarName) {
+  llvm::IRBuilder<> TheBuilder(&TheFunction->getEntryBlock(),
+                               TheFunction->getEntryBlock().begin());
+
+  return TheBuilder.CreateAlloca(llvm::Type::getDoubleTy(TheContext), 0,
+                                 VarName);
+}
+
 llvm::Value *NumberExprAST::codegen() {
   return llvm::ConstantFP::get(TheContext, llvm::APFloat(Val));
 }
@@ -657,8 +740,57 @@ llvm::Value *VariableExprAST::codegen() {
   // Look this variable up in the symbol table
   llvm::Value *V = NamedValues[Name];
   if (!V)
-    LogErrorV("Unknown variable name");
-  return V;
+    return LogErrorV("Unknown variable name");
+
+  // Load the value
+  return Builder.CreateLoad(V, Name);
+}
+
+llvm::Value *VarExprAST::codegen() {
+  std::vector<llvm::AllocaInst *> OldBindings;
+
+  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+
+  // Register all variables and emit their initializer.
+  for (unsigned i = 0; i != VarNames.size(); ++i) {
+    std::string VarName = VarNames[i].first;
+    ExprAST *Init = VarNames[i].second.get();
+
+    // Emit the initializer before adding the variable to scope, this prevents
+    // the initializer from referencing the variable itself. It also permits
+    // things like: var a = 1 in
+    //  var a = a in ... # refers to the outer 'a'.
+    llvm::Value *InitVal;
+    if (Init) {
+      InitVal = Init->codegen();
+      if (!InitVal)
+        return nullptr;
+    } else { // If initial value is not specified, use 0.0.
+      InitVal = llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0));
+    }
+
+    llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+    Builder.CreateStore(InitVal, Alloca);
+
+    // Remember the old variable binding so that we can restore the binding when
+    // we unrecurse.
+    OldBindings.push_back(NamedValues[VarName]);
+
+    // Remember this binding.
+    NamedValues[VarName] = Alloca;
+  }
+
+  // Codegen the body, now that all vars are in scope.
+  llvm::Value *BodyVal = Body->codegen();
+  if (!BodyVal)
+    return nullptr;
+
+  // Pop all our variables from scope.
+  for (unsigned i = 0; i != VarNames.size(); ++i)
+    NamedValues[VarNames[i].first] = OldBindings[i];
+
+  // Return the body computation.
+  return BodyVal;
 }
 
 llvm::Value *IfExprAST::codegen() {
@@ -722,13 +854,19 @@ llvm::Value *IfExprAST::codegen() {
 }
 
 llvm::Value *ForExprAST::codegen() {
-  // Emit the start value first.
+  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
+  llvm::BasicBlock *PreloopBB = Builder.GetInsertBlock();
+
+  // Create an alloca for the variable in the entry block
+  llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(TheFunction, VarName);
+
+  // Emit the start value first, without 'variable' in scope.
   llvm::Value *StartVal = Start->codegen();
   if (!StartVal)
     return nullptr;
 
-  llvm::Function *TheFunction = Builder.GetInsertBlock()->getParent();
-  llvm::BasicBlock *PreloopBB = Builder.GetInsertBlock();
+  // Store the value in the alloca
+  Builder.CreateStore(StartVal, Alloca);
 
   // Make a basic block for the loop.
   llvm::BasicBlock *LoopBB =
@@ -740,15 +878,10 @@ llvm::Value *ForExprAST::codegen() {
   // Start inserting in the loop BB.
   Builder.SetInsertPoint(LoopBB);
 
-  // Create a PHI node for the loop variable.
-  llvm::PHINode *PHINode =
-      Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, VarName);
-  PHINode->addIncoming(StartVal, PreloopBB);
-
-  // Update the symbol table in the loop, so that 'VarName' refers to this PHI
-  // node. Save the old value, so we can restore it later.
-  llvm::Value *OldValue = NamedValues[VarName];
-  NamedValues[VarName] = PHINode;
+  // Update the symbol table in the loop, so that 'VarName' refers to this
+  // alloca node. Save the old value, so we can restore it later.
+  llvm::AllocaInst *OldValue = NamedValues[VarName];
+  NamedValues[VarName] = Alloca;
 
   // Emit the body of the loop. This, like any other expression, can change the
   // current BB. Note that we don't care about the return value (i.e. the value
@@ -766,13 +899,16 @@ llvm::Value *ForExprAST::codegen() {
     StepValue = llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0));
   }
 
-  // Get the next value of the loop variable.
-  llvm::Value *NextValue = Builder.CreateFAdd(PHINode, StepValue, "nextvar");
-
   // Evaluate the loop condition.
   llvm::Value *CondValue = Cond->codegen();
   if (!CondValue)
     return nullptr;
+
+  // Reload, increment, and restore the alloca. This handles the case where the
+  // body of the loop mutates the variable.
+  llvm::Value *CurValue = Builder.CreateLoad(Alloca);
+  llvm::Value *NextValue = Builder.CreateFAdd(CurValue, StepValue, "nextvar");
+  Builder.CreateStore(NextValue, Alloca);
 
   // Like all values, the condition is floating point, so convert it to a bool
   // by using a != 0.0 comparison.
@@ -792,9 +928,6 @@ llvm::Value *ForExprAST::codegen() {
 
   // From this point on, start inserting in the end block.
   Builder.SetInsertPoint(AfterBB);
-
-  // Add the other value of the PHI node.
-  PHINode->addIncoming(NextValue, LoopEndBB);
 
   // Restore the symbol-table mapping.
   if (OldValue)
@@ -819,6 +952,29 @@ llvm::Value *UnaryExprAST::codegen() {
 }
 
 llvm::Value *BinaryExprAST::codegen() {
+  // Special case '=': we don't want to emit the LHS as an expression!
+  if (Op == '=') {
+    // Assignment requires the LHS to be an identifier.
+    // NOTE: This should be a dynamic_cast, but we are building with
+    // -fno-rtti...
+    VariableExprAST *LHSE = static_cast<VariableExprAST *>(LHS.get());
+    if (!LHSE)
+      return LogErrorV("destination of '=' must be a variable");
+
+    // Codegen the RHS.
+    llvm::Value *Val = RHS->codegen();
+    if (!Val)
+      return nullptr;
+
+    // Look up the name of the variable.
+    llvm::Value *Variable = NamedValues[LHSE->getName()];
+    if (!Variable)
+      return LogErrorV("Unknown variable name");
+
+    Builder.CreateStore(Val, Variable);
+    return Val;
+  }
+
   llvm::Value *L = LHS->codegen();
   llvm::Value *R = RHS->codegen();
   if (!L || !R)
@@ -916,8 +1072,17 @@ llvm::Function *FunctionAST::codegen() {
 
   // Record the function arguments in the NamedValues map.
   NamedValues.clear(); // clear arguments of previous function
-  for (auto &Arg : TheFunction->args())
-    NamedValues[Arg.getName()] = &Arg;
+  for (auto &Arg : TheFunction->args()) {
+    // Create an alloca for this variable.
+    llvm::AllocaInst *Alloca = CreateEntryBlockAlloca(
+        TheFunction, static_cast<std::string>(Arg.getName()));
+
+    // Store the initial value in this alloca.
+    Builder.CreateStore(&Arg, Alloca);
+
+    // Add arguments to the variable symbol table.
+    NamedValues[std::string(Arg.getName())] = Alloca;
+  }
 
   if (llvm::Value *RetVal = Body->codegen()) {
     // Finish the function
@@ -1039,6 +1204,9 @@ void InitializeModuleAndPassManager() {
   // Create a new pass manager attached to it
   TheFPM = std::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
 
+  // Promote allocas to registers.
+  TheFPM->add(llvm::createPromoteMemoryToRegisterPass());
+
   // Do simple "peephole" optimizations and bit-twiddling optimizations
   TheFPM->add(llvm::createInstructionCombiningPass());
 
@@ -1085,6 +1253,7 @@ int main(int argc, char *argv[]) {
   TheJIT = std::make_unique<llvm::orc::KaleidoscopeJIT>();
 
   // Register default binary operators.
+  BinopPrecedence['='] = 2;
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
   BinopPrecedence['-'] = 20;
